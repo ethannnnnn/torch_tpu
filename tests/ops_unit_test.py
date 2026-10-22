@@ -6478,6 +6478,20 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
     # Test properties (non-negative)
     self.assertGreaterEqual(t1.min(), 0)
 
+  @parameterized.parameters(
+      (torch.float32, 2**26),
+      (torch.bfloat16, 2**20),
+      (torch.float16, 2**20),
+  )
+  def test_exponential_never_returns_zero(self, dtype, n):
+    """exponential_ samples from (0, inf), so it must never return 0."""
+    # The uniform draw U is exactly 0 with probability eps per element (2^-23
+    # for float32), so returning -log(1 - U) unclamped gives about 8 zeros in
+    # 2^26 float32 draws and about 8192 in 2^20 bfloat16 draws.
+    torch.manual_seed(0)
+    t = torch.empty(n, dtype=dtype, device=torch.device("tpu")).exponential_()
+    self.assertEqual(t.eq(0).sum().item(), 0)
+
   def test_random_distribution(self):
     for dtype in [
         torch.int32,

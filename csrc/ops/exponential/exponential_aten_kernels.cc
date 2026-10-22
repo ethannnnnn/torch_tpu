@@ -16,6 +16,7 @@
 
 #include "csrc/ops/exponential/exponential_aten_kernels.h"
 
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <utility>
@@ -38,7 +39,11 @@
 #include "csrc/ops/op_names.h"
 #include "csrc/ops/rng_utils.h"
 #include "csrc/ops/uniform/uniform.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Support/LLVM.h"
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"
 #include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
@@ -59,6 +64,12 @@ absl::StatusOr<MlirOpResults<1>> BuildExponentialShlo(
 
   // exponential = -ln(1 - U) / lambda
   // U is in [0, 1). 1 - U is in (0, 1].
+  //
+  // U is a multiple of eps, and U == 0 has probability eps (2^-23 for f32,
+  // 2^-7 for bf16). Then ln(1 - U) == 0, but exponential_ must never return 0:
+  // its support is (0, inf). Like ATen's CUDA kernel
+  // (at::transformation::exponential), cap ln(1 - U) at -eps / 2. For U >= eps,
+  // ln(1 - U) <= ln(1 - eps) < -eps / 2, so the cap only affects U == 0.
 
   mlir::MlirOp one_op = MakeScalarConstant(builder, 1.0, mlir_type);
 
@@ -69,9 +80,17 @@ absl::StatusOr<MlirOpResults<1>> BuildExponentialShlo(
   auto tensor_type = GetTensorTypeOrDie(u_bcast);
   one_op = mlir::stablehlo::BroadcastInDim(tensor_type, one_op, {});
 
+  // eps / 2 == 2^-p, where p is the precision (24 for f32, 8 for bf16).
+  const int precision = static_cast<int>(llvm::APFloat::semanticsPrecision(
+      mlir::cast<mlir::FloatType>(tensor_type.getElementType())
+          .getFloatSemantics()));
+  mlir::MlirOp max_log_op =
+      MakeConstantLike(u_bcast, -std::ldexp(1.0, -precision));
+
   auto one_minus_u = mlir::stablehlo::Subtract(one_op, u_bcast);
   auto log_one_minus_u = mlir::stablehlo::Log(one_minus_u);
-  auto neg_log = mlir::stablehlo::Neg(log_one_minus_u);
+  auto capped_log = mlir::stablehlo::Min(log_one_minus_u, max_log_op);
+  auto neg_log = mlir::stablehlo::Neg(capped_log);
   auto result = mlir::stablehlo::Div(neg_log, lambd_bcast);
 
   return result;
