@@ -140,6 +140,27 @@ class SplitCompileTest(seed_test_utils.RepeatableTest):
     utils.assert_close(res_add.cpu(), expected)
     utils.assert_close(res_weight.cpu(), expected)
 
+  def test_split_graph_returns_read_only_placeholder_as_is(self):
+    """Verifies that a returned placeholder that is only read is not copied."""
+    graph = torch.fx.Graph()
+    p_x = graph.placeholder("x")
+    p_weight = graph.placeholder("weight")
+    t_node = graph.call_function(torch.ops.aten.t.default, (p_weight,))
+    mm_node = graph.call_function(torch.ops.aten.mm.default, (p_x, t_node))
+    graph.output((mm_node, p_weight))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    base_compiler = compiler.StaticCompiler()
+    split_comp = split_compiler.SplitCompiler(base_compiler)
+
+    x = torch.ones((2, 4), device="tpu")
+    weight = torch.ones((3, 4), device="tpu")
+    executable = split_comp(gm, (x, weight))
+    res_mm, res_weight = executable(x, weight)
+
+    self.assertIs(res_weight, weight)
+    utils.assert_close(res_mm.cpu(), torch.full((2, 3), 4.0, device="cpu"))
+
   def test_compiling_get_attr_constant_does_not_copy_it(self):
     """Verifies that compiling a graph does not duplicate `get_attr` constants."""
     # 128 MiB parameter: 1024 * 32768 * 4 bytes = 134,217,728 bytes.

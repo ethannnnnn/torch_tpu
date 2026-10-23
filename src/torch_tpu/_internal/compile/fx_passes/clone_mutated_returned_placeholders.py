@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Clones placeholder nodes that are returned in the graph output and used in computation."""
+"""Clones placeholder nodes that the graph both mutates and returns."""
+
+import operator
+from typing import Any
 
 import torch
+from torch._functorch._aot_autograd import descriptors as _aot_descriptors
+from torch._library import utils as library_utils
+
+# Ops whose schema does not annotate an alias although the result can share the
+# input's storage.
+_UNANNOTATED_ALIAS_OPS = frozenset({
+    torch.ops.aten._unsafe_view.default,  # pylint: disable=protected-access
+})
 
 
 def _normalize_gm_and_graph(
@@ -38,10 +49,80 @@ def _get_output_node(graph: torch.fx.Graph) -> torch.fx.Node | None:
   return output_nodes[0]
 
 
-def _get_returned_nodes(output_node: torch.fx.Node) -> set[torch.fx.Node]:
-  """Extracts all FX nodes returned by the output node."""
-  flat_output_args, _ = torch.utils._pytree.tree_flatten(output_node.args)
-  return {arg for arg in flat_output_args if isinstance(arg, torch.fx.Node)}
+def _get_nodes(value: Any) -> set[torch.fx.Node]:
+  """Extracts all FX nodes in a (possibly nested) argument value."""
+  flat_args, _ = torch.utils._pytree.tree_flatten(value)
+  return {arg for arg in flat_args if isinstance(arg, torch.fx.Node)}
+
+
+def _root_descriptor(desc: Any) -> Any:
+  """Strips tensor subclass attributes from an AOTAutograd descriptor."""
+  while isinstance(
+      desc,
+      (
+          _aot_descriptors.SubclassGetAttrAOTInput,
+          _aot_descriptors.SubclassGetAttrAOTOutput,
+      ),
+  ):
+    desc = desc.base
+  return desc
+
+
+def _find_mutated_placeholders(
+    graph: torch.fx.Graph, output_node: torch.fx.Node
+) -> set[torch.fx.Node]:
+  """Returns the placeholders whose storage may be written to.
+
+  An op writes to the arguments annotated `Tensor(a!)` in its schema. A write
+  to a view, a `getitem` of a view or an `_UNANNOTATED_ALIAS_OPS` result counts
+  as a write to the placeholders it aliases. Targets without a schema are
+  assumed to write to all of their inputs and to return aliases of them.
+
+  AOTAutograd graphs return the new value of each input that they mutate, and
+  AOTAutograd copies it into the input after the graph runs, so these
+  placeholders count as written too.
+  """
+  mutated_inputs = set()
+  for desc in output_node.meta.get("desc") or ():
+    desc = _root_descriptor(desc)
+    if isinstance(desc, _aot_descriptors.InputMutationAOTOutput):
+      mutated_inputs.add(_root_descriptor(desc.mutated_input))
+
+  aliases: dict[torch.fx.Node, set[torch.fx.Node]] = {}
+  mutated: set[torch.fx.Node] = set()
+
+  def aliased(value: Any) -> set[torch.fx.Node]:
+    return set().union(*(aliases.get(n, ()) for n in _get_nodes(value)))
+
+  for node in graph.nodes:
+    if node.op == "placeholder":
+      aliases[node] = {node}
+      if _root_descriptor(node.meta.get("desc")) in mutated_inputs:
+        mutated.add(node)
+    elif node.op in ("get_attr", "output"):
+      continue
+    elif node.op == "call_function" and isinstance(
+        node.target, torch._ops.OpOverload  # pylint: disable=protected-access
+    ):
+      schema = node.target._schema  # pylint: disable=protected-access
+      may_alias = set()
+      for argument, value in library_utils.zip_schema(
+          schema, node.args, node.kwargs
+      ):
+        if argument.alias_info is not None:
+          may_alias |= aliased(value)
+          if argument.alias_info.is_write:
+            mutated |= aliased(value)
+      if node.target in _UNANNOTATED_ALIAS_OPS:
+        aliases[node] = aliased(node.all_input_nodes)
+      elif any(r.alias_info is not None for r in schema.returns):
+        aliases[node] = may_alias
+    elif node.op == "call_function" and node.target is operator.getitem:
+      aliases[node] = aliased(node.all_input_nodes)
+    else:
+      aliases[node] = aliased(node.all_input_nodes)
+      mutated |= aliases[node]
+  return mutated
 
 
 def _is_returned_compute_placeholder(
@@ -58,13 +139,16 @@ def _is_returned_compute_placeholder(
 
 def _find_placeholders_to_clone(
     graph: torch.fx.Graph,
-    returned_nodes: set[torch.fx.Node],
+    output_node: torch.fx.Node,
 ) -> list[torch.fx.Node]:
   """Identifies all placeholder nodes that need cloning."""
+  returned_nodes = _get_nodes(output_node.args)
+  mutated = _find_mutated_placeholders(graph, output_node)
   return [
       node
       for node in graph.nodes
       if _is_returned_compute_placeholder(node, returned_nodes)
+      and node in mutated
   ]
 
 
@@ -88,7 +172,7 @@ def _clone_and_replace_placeholder(
 def apply(
     gm_or_graph: torch.fx.GraphModule | torch.fx.Graph,
 ) -> None:
-  """Clones placeholder nodes that are returned in the output and used in compute.
+  """Clones placeholder nodes that are returned in the output and mutated.
 
   When an FX graph contains in-place operations that mutate input placeholders,
   the graph's output node may reference the input placeholder directly.
@@ -96,6 +180,11 @@ def apply(
   If a pass (e.g. `split_module`) alters the graph structure such that a mutated
   placeholder is no longer in the output, the output will be a passthrough
   meaning that the user won't receive the mutated value.
+
+  A returned placeholder that is only read stays a passthrough instead of
+  becoming a program output. AOTAutograd's forward graphs return every
+  parameter that the backward graph needs, and cloning them would copy each one
+  and keep the copies alive until backward.
 
   Args:
     gm_or_graph: The FX GraphModule or Graph to modify.
@@ -106,8 +195,7 @@ def apply(
   if output_node is None:
     return
 
-  returned_nodes = _get_returned_nodes(output_node)
-  placeholders_to_clone = _find_placeholders_to_clone(graph, returned_nodes)
+  placeholders_to_clone = _find_placeholders_to_clone(graph, output_node)
   if not placeholders_to_clone:
     return
 
