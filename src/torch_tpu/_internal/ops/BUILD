@@ -20,6 +20,7 @@ load(
     "//build_files:build_defs.bzl",
     "torch_tpu_package_end",
     "torch_tpu_py_library",
+    "torch_tpu_py_test",
 )
 
 package(
@@ -72,6 +73,25 @@ torch_tpu_py_library(
         "//src/torch_tpu/_internal/pallas",
         "//src/torch_tpu/_internal/utils:annotations",
         "@pypi//jax",
+    ],
+)
+
+torch_tpu_py_test(
+    name = "splash_attention_test",
+    srcs = ["splash_attention_test.py"],
+    main = "splash_attention_test.py",
+    run_on_accelerators = [
+        "requires-tpu-v6e",
+        "requires-tpu-v7x",
+    ],
+    deps = [
+        ":splash_attention",
+        "//shims/absl_py/testing:absltest",
+        "//shims/absl_py/testing:parameterized",
+        "//shims/torch:pytorch",
+        "//src/torch_tpu",
+        "//src/torch_tpu/_internal/utils:test_utils",
+        "//tests:seed_test_utils",
     ],
 )
 

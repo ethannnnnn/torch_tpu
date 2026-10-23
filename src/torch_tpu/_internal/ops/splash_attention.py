@@ -44,6 +44,32 @@ __all__ = [
 
 _DEFAULT_MASK_VALUE = splash_attention_kernel.DEFAULT_MASK_VALUE
 
+# KV block sizes must be multiples of the 128 TPU lanes; the defaults use the
+# same alignment for every block.
+_BLOCK_ALIGNMENT = 128
+_MAX_DEFAULT_BLOCK_SIZE = 512
+
+
+def _default_block_size(length: int) -> int:
+  """Returns the largest multiple of 128 that divides `length`, up to 512.
+
+  Args:
+    length: The sequence length, or the enclosing block size to tile.
+
+  Raises:
+    ValueError: If `length` is not a positive multiple of 128.
+  """
+  if length <= 0 or length % _BLOCK_ALIGNMENT:
+    raise ValueError(
+        "splash_sdpa cannot pick a default block size for length"
+        f" {length}: the sequence length and explicit block sizes must be"
+        f" multiples of {_BLOCK_ALIGNMENT}."
+    )
+  block = min(length, _MAX_DEFAULT_BLOCK_SIZE)
+  while length % block:
+    block -= _BLOCK_ALIGNMENT
+  return block
+
 
 def _make_splash_attention_fn(
     seq_len: int,
@@ -71,7 +97,8 @@ def _make_splash_attention_fn(
   Args:
     seq_len: Sequence length.
     n_heads: Number of query heads.
-    n_kv_heads: Number of key/value heads.
+    n_kv_heads: Number of key/value heads. Must divide `n_heads`; grouped K/V
+      heads are read by the kernel directly.
     scale: Scale factor for attention logits, or None.
     is_causal: Whether to apply causal mask.
     local_window_size: Size of sliding window attention mask, or None.
@@ -447,14 +474,14 @@ def splash_sdpa(
     scale: Optional[float] = None,
     is_causal: bool = True,
     local_window_size: Optional[int] = None,
-    enable_gqa: bool = False,  # Kept for API compatibility
-    block_q: int = 512,
-    block_kv: int = 512,
-    block_dkv: int = 512,
-    block_kv_compute: int = 512,
-    block_q_dkv: int = 512,
-    block_kv_dkv: int = 512,
-    block_kv_dkv_compute: int = 512,
+    enable_gqa: bool = False,
+    block_q: Optional[int] = None,
+    block_kv: Optional[int] = None,
+    block_dkv: Optional[int] = None,
+    block_kv_compute: Optional[int] = None,
+    block_q_dkv: Optional[int] = None,
+    block_kv_dkv: Optional[int] = None,
+    block_kv_dkv_compute: Optional[int] = None,
     block_q_dq: Optional[int] = None,
     block_kv_dq: Optional[int] = None,
     use_fused_bwd_kernel: bool = True,
@@ -473,22 +500,29 @@ def splash_sdpa(
       This API is experimental and subject to change in future releases.
 
   Args:
-    q: Query tensor.
-    k: Key tensor.
-    v: Value tensor.
+    q: Query tensor of shape (batch, n_heads, seq_len, head_dim).
+    k: Key tensor of shape (batch, n_kv_heads, seq_len, head_dim). `n_kv_heads`
+      must divide `n_heads`. Grouped K/V heads are read by the kernel directly,
+      without expanding them to `n_heads`.
+    v: Value tensor of shape (batch, n_kv_heads, seq_len, head_dim).
     scale: Scale factor for attention logits.
     is_causal: Whether to apply causal mask.
     local_window_size: Size of sliding window attention mask, or None.
-    enable_gqa: Kept for API compatibility.
-    block_q: Block size for Q.
+    enable_gqa: Must be True if and only if `n_kv_heads != n_heads`.
+    block_q: Block size for Q. Defaults to the largest multiple of 128 that
+      divides `seq_len` and is at most 512, as do `block_kv`, `block_q_dkv` and
+      `block_kv_dkv`.
     block_kv: Block size for KV.
-    block_dkv: Block size for the dk/dv backward kernel tiles. Smaller values
-      reduce the XLA program size (enabling larger batch sizes) at a small
-      efficiency cost. Default 512 matches block_kv; use 256 for large batches.
-    block_kv_compute: Block size for KV compute.
+    block_dkv: If set, overrides both `block_q_dkv` and `block_kv_dkv`. Smaller
+      values reduce the XLA program size (enabling larger batch sizes) at a
+      small efficiency cost; use 256 for large batches.
+    block_kv_compute: Block size for KV compute. Must divide `block_kv`, and
+      defaults to the largest multiple of 128 up to 512 that does.
     block_q_dkv: Block size for Q in DKV.
     block_kv_dkv: Block size for KV in DKV.
-    block_kv_dkv_compute: Block size for KV compute in DKV.
+    block_kv_dkv_compute: Block size for KV compute in DKV. Must divide
+      `block_kv_dkv`, and defaults to the largest multiple of 128 up to 512 that
+      does.
     block_q_dq: Block size for Q in DQ.
     block_kv_dq: Block size for KV in DQ.
     use_fused_bwd_kernel: Whether to use fused backward kernel.
@@ -501,10 +535,6 @@ def splash_sdpa(
     Output tensor of scaled dot-product attention.
   """
 
-  if block_dkv != 512:
-    block_q_dkv = block_dkv
-    block_kv_dkv = block_dkv
-
   _, n_heads, seq_len, _ = q.shape
   n_kv_heads = k.shape[1]
 
@@ -513,18 +543,32 @@ def splash_sdpa(
         f"enable_gqa ({enable_gqa}) does not match inputs: "
         f"n_heads={n_heads}, n_kv_heads={n_kv_heads}"
     )
+  if n_heads % n_kv_heads:
+    raise ValueError(
+        f"n_kv_heads ({n_kv_heads}) must divide n_heads ({n_heads})"
+    )
+
+  if block_dkv is not None:
+    block_q_dkv = block_dkv
+    block_kv_dkv = block_dkv
+  if block_q is None:
+    block_q = _default_block_size(seq_len)
+  if block_kv is None:
+    block_kv = _default_block_size(seq_len)
+  if block_kv_compute is None:
+    block_kv_compute = _default_block_size(min(block_kv, seq_len))
+  if block_q_dkv is None:
+    block_q_dkv = _default_block_size(seq_len)
+  if block_kv_dkv is None:
+    block_kv_dkv = _default_block_size(seq_len)
+  if block_kv_dkv_compute is None:
+    block_kv_dkv_compute = _default_block_size(min(block_kv_dkv, seq_len))
 
   if n_kv_heads == 1:
     # For MQA (1 kv head) the splash attention kernel expects the kv
     # head dimension to be squeezed.
     k = torch.squeeze(k, dim=1)
     v = torch.squeeze(v, dim=1)
-  elif n_heads != n_kv_heads:
-    # For GQA (1 < n_kv_heads < n_heads), expand KV heads to match Q heads.
-    group = n_heads // n_kv_heads
-    k = k.repeat_interleave(group, dim=1)
-    v = v.repeat_interleave(group, dim=1)
-    n_kv_heads = n_heads
 
   splash_args = dict(
       seq_len=seq_len,
