@@ -19831,6 +19831,42 @@ class OpsGradUnitTest(TorchTpuVsCpuTestBase):
 
           self.assert_close_tpu_vs_cpu(compute_empty_prob)
 
+  def test_cross_entropy_flattened_logits_slice_compiles_quickly(self):
+    """No-grad cross_entropy over `logits[:, :-1].flatten(0, 1)`.
+
+    The flattened slice is a (B, S - 1, V) buffer viewed as (B * (S - 1), V).
+    With S - 1 not a multiple of 8 that reshape changes the TPU tile layout, and
+    materializing it (for example as the operand of a gather) took about 90 s to
+    compile on TPU v7 at this size. The loss must read the log-probs through
+    reductions only, which XLA hoists above the reshape.
+    """
+    b, s, v = 2, 2048, 151936
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(b, s, v, generator=g, dtype=torch.bfloat16)
+    labels = torch.randint(0, v, (b, s), generator=g)
+
+    tpu_seconds = []
+
+    def compute(device):
+      x = logits.to(device)
+      y = labels[:, 1:].flatten().to(device)
+      on_tpu = torch.device(device).type == "tpu"
+      if on_tpu:
+        torch.accelerator.synchronize()
+      start = time.monotonic()
+      with torch.no_grad():
+        loss = torch.nn.functional.cross_entropy(
+            x[:, :-1, :].flatten(0, 1), y, reduction="none"
+        )
+      if on_tpu:
+        torch.accelerator.synchronize()
+        tpu_seconds.append(time.monotonic() - start)
+      return loss
+
+    self.assert_close_tpu_vs_cpu(compute)
+    # About 2 s on TPU v7 with reductions only, about 90 s with the gather.
+    self.assertLess(tpu_seconds[0], 30.0)
+
   @parameterized.product(
       shape=[(100,), (0,), (2, 10, 5), (2, 2, 2, 2), (1, 0, 2)],
       return_inverse=[True, False],
