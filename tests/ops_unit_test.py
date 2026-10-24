@@ -6097,6 +6097,71 @@ class OpsUnitTest(TorchTpuVsCpuTestBase):
 
     self.assert_close_tpu_vs_cpu(fn)
 
+  @parameterized.product(
+      dtype=[torch.bfloat16, torch.float32], world_size=[1, 2, 8]
+  )
+  def test_split_with_sizes_copy_fsdp2_copy_out(self, dtype, world_size):
+    """Tests split_with_sizes_copy as FSDP2 (fully_shard) calls it.
+
+    After every all-gather, FSDP2 views the flat buffer as (world_size, N) and
+    copies its columns into (world_size, split_size) views of flat
+    per-parameter buffers.
+
+    Args:
+      dtype: The dtype of the buffers.
+      world_size: The number of rows of the all-gather buffer.
+    """
+    split_sizes = [512, 128, 1, 0, 130]
+    gathered = torch.randn(world_size * sum(split_sizes)).to(dtype)
+
+    def fn(device):
+      out = [
+          torch.empty(world_size * size, dtype=dtype, device=device).view(
+              world_size, size
+          )
+          for size in split_sizes
+      ]
+      torch.split_with_sizes_copy(
+          gathered.to(device).view(world_size, -1), split_sizes, dim=1, out=out
+      )
+      return tuple(out)
+
+    self.assert_close_tpu_vs_cpu(fn, check_value=CheckValueMode.STRICT)
+
+  def test_split_with_sizes_copy_fsdp2_ops_do_not_grow_with_world_size(self):
+    """FSDP2's copy-out must not record more ATen ops for more ranks."""
+    split_sizes = [512, 128, 1, 130]
+
+    def count_aten_ops(world_size):
+      gathered = torch.randn(world_size * sum(split_sizes), device="tpu")
+      out = [
+          torch.empty(world_size * size, device="tpu").view(world_size, size)
+          for size in split_sizes
+      ]
+      with torch.profiler.profile(
+          activities=[torch.profiler.ProfilerActivity.CPU]
+      ) as prof:
+        torch.split_with_sizes_copy(
+            gathered.view(world_size, -1), split_sizes, dim=1, out=out
+        )
+      return sum(
+          event.count
+          for event in prof.key_averages()
+          if event.key.startswith("aten::")
+      )
+
+    self.assertEqual(count_aten_ops(2), count_aten_ops(16))
+
+  def test_split_with_sizes_copy_dim1_split_sizes_mismatch(self):
+    def fn(device):
+      out = [torch.empty(2, 2, device=device), torch.empty(2, 3, device=device)]
+      torch.split_with_sizes_copy(
+          torch.zeros(2, 6, device=device), [2, 3], dim=1, out=out
+      )
+      return tuple(out)
+
+    self.assert_close_tpu_vs_cpu(fn, allow_failure=True)
+
   def test_cumprod_default_dtype(self):
     """Tests torch.cumprod with default dtype (None)."""
     x = torch.randn(2, 3, dtype=torch.float32)
