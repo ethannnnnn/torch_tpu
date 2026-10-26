@@ -21,10 +21,22 @@ import torch
 from torch._functorch._aot_autograd import descriptors as _aot_descriptors
 from torch._library import utils as library_utils
 
-# Ops whose schema does not annotate an alias although the result can share the
-# input's storage.
+# Ops whose results can share storage with an input although their schemas do
+# not annotate an alias.
 _UNANNOTATED_ALIAS_OPS = frozenset({
     torch.ops.aten._unsafe_view.default,  # pylint: disable=protected-access
+    torch.ops.aten.lift.default,
+    torch.ops.aten.set.source_Tensor,
+    torch.ops.aten.unsafe_chunk.default,
+    torch.ops.aten.unsafe_split.Tensor,
+    torch.ops.aten.unsafe_split_with_sizes.default,
+})
+
+# After `self.set_(source)`, `self` and the result share the storage of
+# `source`, which the schema does not annotate.
+_SET_SOURCE_OPS = frozenset({
+    torch.ops.aten.set_.source_Tensor,
+    torch.ops.aten.set_.source_Tensor_storage_offset,
 })
 
 
@@ -56,7 +68,7 @@ def _get_nodes(value: Any) -> set[torch.fx.Node]:
 
 
 def _root_descriptor(desc: Any) -> Any:
-  """Strips tensor subclass attributes from an AOTAutograd descriptor."""
+  """Unwraps `SubclassGetAttr*` descriptors to the outer tensor's descriptor."""
   while isinstance(
       desc,
       (
@@ -73,14 +85,12 @@ def _find_mutated_placeholders(
 ) -> set[torch.fx.Node]:
   """Returns the placeholders whose storage may be written to.
 
-  An op writes to the arguments annotated `Tensor(a!)` in its schema. A write
-  to a view, a `getitem` of a view or an `_UNANNOTATED_ALIAS_OPS` result counts
-  as a write to the placeholders it aliases. Targets without a schema are
+  A write to a `Tensor(a!)` argument counts as a write to every placeholder
+  the argument may alias, through views, `getitem`, `_UNANNOTATED_ALIAS_OPS`
+  or `_SET_SOURCE_OPS`. Targets without a schema, other than `getitem`, are
   assumed to write to all of their inputs and to return aliases of them.
-
-  AOTAutograd graphs return the new value of each input that they mutate, and
-  AOTAutograd copies it into the input after the graph runs, so these
-  placeholders count as written too.
+  Inputs that AOTAutograd copies a new value into after the graph runs count
+  as written too.
   """
   mutated_inputs = set()
   for desc in output_node.meta.get("desc") or ():
@@ -88,6 +98,7 @@ def _find_mutated_placeholders(
     if isinstance(desc, _aot_descriptors.InputMutationAOTOutput):
       mutated_inputs.add(_root_descriptor(desc.mutated_input))
 
+  # Maps each node to the placeholders whose storage it may share.
   aliases: dict[torch.fx.Node, set[torch.fx.Node]] = {}
   mutated: set[torch.fx.Node] = set()
 
@@ -105,10 +116,12 @@ def _find_mutated_placeholders(
         node.target, torch._ops.OpOverload  # pylint: disable=protected-access
     ):
       schema = node.target._schema  # pylint: disable=protected-access
+      args = {}
       may_alias = set()
       for argument, value in library_utils.zip_schema(
           schema, node.args, node.kwargs
       ):
+        args[argument.name] = value
         if argument.alias_info is not None:
           may_alias |= aliased(value)
           if argument.alias_info.is_write:
@@ -117,6 +130,10 @@ def _find_mutated_placeholders(
         aliases[node] = aliased(node.all_input_nodes)
       elif any(r.alias_info is not None for r in schema.returns):
         aliases[node] = may_alias
+      if node.target in _SET_SOURCE_OPS:
+        source = aliased(args["source"])
+        for n in _get_nodes(args["self"]) | {node}:
+          aliases[n] = aliases.get(n, set()) | source
     elif node.op == "call_function" and node.target is operator.getitem:
       aliases[node] = aliased(node.all_input_nodes)
     else:
@@ -181,10 +198,9 @@ def apply(
   placeholder is no longer in the output, the output will be a passthrough
   meaning that the user won't receive the mutated value.
 
-  A returned placeholder that is only read stays a passthrough instead of
-  becoming a program output. AOTAutograd's forward graphs return every
-  parameter that the backward graph needs, and cloning them would copy each one
-  and keep the copies alive until backward.
+  A returned placeholder that is only read stays a passthrough. AOTAutograd
+  forward graphs return every parameter that backward needs, and cloning them
+  would keep a copy of each one alive until backward.
 
   Args:
     gm_or_graph: The FX GraphModule or Graph to modify.

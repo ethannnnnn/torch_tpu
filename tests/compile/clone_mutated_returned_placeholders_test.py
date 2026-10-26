@@ -24,6 +24,7 @@ from torch._dynamo.backends.common import aot_autograd
 from torch._functorch.partitioners import min_cut_rematerialization_partition
 from torch.testing._internal.two_tensor import TwoTensor
 from torch_tpu._internal.compile.fx_passes import clone_mutated_returned_placeholders
+from torch_tpu._internal.utils import test_utils as utils
 from tests import seed_test_utils
 
 GraphModule = fx.GraphModule
@@ -267,7 +268,7 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
     p_unsafe = graph.placeholder("unsafe")
     p_out = graph.placeholder("out")
     p_opaque = graph.placeholder("opaque")
-    p_fresh = graph.placeholder("fresh")
+    p_read = graph.placeholder("read")
     graph.call_function(
         aten.add_.Scalar,
         (graph.call_function(aten.view.default, (p_view, [16])), 1.0),
@@ -281,31 +282,86 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
         aten.add_.Scalar,
         (graph.call_function(aten._unsafe_view.default, (p_unsafe, [16])), 1.0),
     )
-    graph.call_function(aten.add.out, (p_fresh, p_fresh), {"out": p_out})
+    out = graph.call_function(aten.add.out, (p_read, p_read), {"out": p_out})
+    graph.call_function(aten.add_.Scalar, (out, 1.0))
     graph.call_function(lambda t: t, (p_opaque,))
-    fresh = graph.call_function(aten.clone.default, (p_fresh,))
+    read_pieces = graph.call_function(aten.split.Tensor, (p_read, 2))
+    graph.call_function(operator.getitem, (read_pieces, 0))
+    fresh = graph.call_function(aten.mul.Scalar, (p_read, 2.0))
     graph.call_function(
         aten.add_.Scalar,
         (graph.call_function(aten.view.default, (fresh, [16])), 1.0),
     )
-    graph.output((p_view, p_split, p_unsafe, p_out, p_opaque, p_fresh))
-    cloned_before = _cloned_placeholders(graph)
+    graph.output((p_view, p_split, p_unsafe, p_out, p_opaque, p_read))
 
     clone_mutated_returned_placeholders.apply(graph)
 
     self.assertEqual(
-        _cloned_placeholders(graph) - cloned_before,
+        _cloned_placeholders(graph),
         {"view", "split", "unsafe", "out", "opaque"},
     )
+
+  def test_placeholder_written_through_unannotated_alias_is_cloned(self):
+    """Verifies writes through aliases that op schemas do not annotate."""
+    graph = Graph()
+    names = (
+        "unsafe_split",
+        "unsafe_split_sizes",
+        "unsafe_chunk",
+        "lift",
+        "functional_set",
+        "source",
+        "offset_source",
+        "rebound",
+        "new_source",
+        "read",
+    )
+    p = {name: graph.placeholder(name) for name in names}
+
+    def write(node):
+      graph.call_function(aten.add_.Scalar, (node, 1.0))
+
+    def empty():
+      return graph.call_function(aten.empty.memory_format, ([0],))
+
+    for name, target, size in (
+        ("unsafe_split", aten.unsafe_split.Tensor, 2),
+        ("unsafe_split_sizes", aten.unsafe_split_with_sizes.default, [2, 2]),
+        ("unsafe_chunk", aten.unsafe_chunk.default, 2),
+    ):
+      pieces = graph.call_function(target, (p[name], size))
+      write(graph.call_function(operator.getitem, (pieces, 1)))
+    write(graph.call_function(aten.lift.default, (p["lift"],)))
+    for name, target in (
+        ("functional_set", aten.set.source_Tensor),
+        ("source", aten.set_.source_Tensor),
+    ):
+      write(graph.call_function(target, (empty(), p[name])))
+    offset_view = empty()
+    graph.call_function(
+        aten.set_.source_Tensor_storage_offset,
+        (offset_view, p["offset_source"], 0, [16], [1]),
+    )
+    write(offset_view)
+    graph.call_function(
+        aten.set_.source_Tensor, (p["rebound"], p["new_source"])
+    )
+    write(p["rebound"])
+    graph.call_function(aten.set_.source_Tensor, (empty(), p["read"]))
+    graph.output(tuple(p.values()))
+
+    clone_mutated_returned_placeholders.apply(graph)
+
+    self.assertEqual(_cloned_placeholders(graph), set(names) - {"read"})
 
   def _check_compiled_forward_clones_only_running_var(
       self, running_var: torch.Tensor
   ):
-    """Checks an AOTAutograd forward graph, with TpuBackend's settings.
+    """Compiles `_NormalizeByRunningVariance` with TpuBackend's settings.
 
-    The forward graph returns the weight and the input for the backward graph,
-    and the buffer too, since min-cut recomputes `rsqrt` in the backward. Only
-    the buffer, which AOTAutograd updates after the graph runs, is cloned.
+    The forward graph returns the weight and the input for backward, and the
+    buffer too, because min-cut recomputes `rsqrt` in backward. Only the
+    buffer, which AOTAutograd updates after the graph runs, should be cloned.
 
     Args:
       running_var: The buffer, of shape (32,).
@@ -344,11 +400,9 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
         if n.op == "call_function" and n.target == aten.clone.default
     ]
     self.assertEqual(set(cloned), {running_var.shape})
-    torch.testing.assert_close(x.grad, eager_x.grad)
-    torch.testing.assert_close(
-        model.linear.weight.grad, eager_model.linear.weight.grad
-    )
-    torch.testing.assert_close(model.running_var, eager_model.running_var)
+    utils.assert_close(x.grad, eager_x.grad)
+    utils.assert_close(model.linear.weight.grad, eager_model.linear.weight.grad)
+    utils.assert_close(model.running_var, eager_model.running_var)
 
   def test_compiled_forward_clones_only_the_input_it_mutates(self):
     """Verifies that only the input that AOTAutograd mutates is cloned."""
