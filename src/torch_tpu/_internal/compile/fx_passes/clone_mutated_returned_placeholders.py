@@ -80,6 +80,53 @@ def _root_descriptor(desc: Any) -> Any:
   return desc
 
 
+def _aliased(
+    aliases: dict[torch.fx.Node, set[torch.fx.Node]], value: Any
+) -> set[torch.fx.Node]:
+  """Returns the placeholders that the nodes in `value` may alias."""
+  return set().union(*(aliases.get(n, ()) for n in _get_nodes(value)))
+
+
+def _track_op_overload(
+    node: torch.fx.Node,
+    aliases: dict[torch.fx.Node, set[torch.fx.Node]],
+    mutated: set[torch.fx.Node],
+) -> None:
+  """Records what an op with a schema may write to and what its result aliases.
+
+  Args:
+    node: A `call_function` node whose target is an `OpOverload`.
+    aliases: Maps each node seen so far to the placeholders it may alias.
+      Updated in place.
+    mutated: The placeholders that may be written to. Updated in place.
+  """
+  op = node.target
+  assert isinstance(
+      op, torch._ops.OpOverload  # pylint: disable=protected-access
+  )
+  schema = op._schema  # pylint: disable=protected-access
+  arguments = list(library_utils.zip_schema(schema, node.args, node.kwargs))
+  # Arguments without alias_info are only read, and no result shares their
+  # storage.
+  annotated = [
+      (argument.alias_info, _aliased(aliases, value))
+      for argument, value in arguments
+      if argument.alias_info is not None
+  ]
+  for alias_info, value_aliases in annotated:
+    if alias_info.is_write:
+      mutated.update(value_aliases)
+
+  if any(r.alias_info is not None for r in schema.returns):
+    aliases[node] = set().union(*(a for _, a in annotated))
+
+  if node.target in _SET_SOURCE_OPS:
+    values = {argument.name: value for argument, value in arguments}
+    source = _aliased(aliases, values["source"])
+    for n in _get_nodes(values["self"]) | {node}:
+      aliases[n] = aliases.get(n, set()) | source
+
+
 def _find_mutated_placeholders(
     graph: torch.fx.Graph, output_node: torch.fx.Node
 ) -> set[torch.fx.Node]:
@@ -93,6 +140,8 @@ def _find_mutated_placeholders(
   as written too.
   """
   mutated_inputs = set()
+  # Only AOTAutograd sets `desc`. Graphs from make_fx or symbolic_trace, or
+  # built by hand, have none.
   for desc in output_node.meta.get("desc") or ():
     desc = _root_descriptor(desc)
     if isinstance(desc, _aot_descriptors.InputMutationAOTOutput):
@@ -101,10 +150,6 @@ def _find_mutated_placeholders(
   # Maps each node to the placeholders whose storage it may share.
   aliases: dict[torch.fx.Node, set[torch.fx.Node]] = {}
   mutated: set[torch.fx.Node] = set()
-
-  def aliased(value: Any) -> set[torch.fx.Node]:
-    return set().union(*(aliases.get(n, ()) for n in _get_nodes(value)))
-
   for node in graph.nodes:
     if node.op == "placeholder":
       aliases[node] = {node}
@@ -112,32 +157,24 @@ def _find_mutated_placeholders(
         mutated.add(node)
     elif node.op in ("get_attr", "output"):
       continue
+    elif node.op == "call_function" and node.target in _UNANNOTATED_ALIAS_OPS:
+      # These ops write nothing, and their schemas leave out that the result
+      # shares storage with the inputs.
+      aliases[node] = _aliased(aliases, node.all_input_nodes)
     elif node.op == "call_function" and isinstance(
         node.target, torch._ops.OpOverload  # pylint: disable=protected-access
     ):
-      schema = node.target._schema  # pylint: disable=protected-access
-      args = {}
-      may_alias = set()
-      for argument, value in library_utils.zip_schema(
-          schema, node.args, node.kwargs
-      ):
-        args[argument.name] = value
-        if argument.alias_info is not None:
-          may_alias |= aliased(value)
-          if argument.alias_info.is_write:
-            mutated |= aliased(value)
-      if node.target in _UNANNOTATED_ALIAS_OPS:
-        aliases[node] = aliased(node.all_input_nodes)
-      elif any(r.alias_info is not None for r in schema.returns):
-        aliases[node] = may_alias
-      if node.target in _SET_SOURCE_OPS:
-        source = aliased(args["source"])
-        for n in _get_nodes(args["self"]) | {node}:
-          aliases[n] = aliases.get(n, set()) | source
+      # Only OpOverloads have a schema that says what they write and alias.
+      _track_op_overload(node, aliases, mutated)
     elif node.op == "call_function" and node.target is operator.getitem:
-      aliases[node] = aliased(node.all_input_nodes)
+      # `getitem` picks an element of a list or tuple, such as one result of
+      # `split`. It shares that element's storage but writes nothing.
+      aliases[node] = _aliased(aliases, node.all_input_nodes)
     else:
-      aliases[node] = aliased(node.all_input_nodes)
+      # Other targets have no schema to read: higher-order ops such as
+      # `auto_functionalized`, Python callables, `call_module` and `call_method`
+      # nodes. For safety, assume they write to and alias all of their inputs.
+      aliases[node] = _aliased(aliases, node.all_input_nodes)
       mutated |= aliases[node]
   return mutated
 

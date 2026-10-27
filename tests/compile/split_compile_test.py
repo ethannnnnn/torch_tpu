@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import collections
+import copy
 import gc
 import pickle
 import unittest.mock
@@ -140,26 +141,67 @@ class SplitCompileTest(seed_test_utils.RepeatableTest):
     utils.assert_close(res_add.cpu(), expected)
     utils.assert_close(res_weight.cpu(), expected)
 
-  def test_split_graph_returns_read_only_placeholder_as_is(self):
-    """Verifies that a returned placeholder that is only read is not copied."""
-    graph = torch.fx.Graph()
-    p_x = graph.placeholder("x")
-    p_weight = graph.placeholder("weight")
-    t_node = graph.call_function(torch.ops.aten.t.default, (p_weight,))
-    mm_node = graph.call_function(torch.ops.aten.mm.default, (p_x, t_node))
-    graph.output((mm_node, p_weight))
-    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+  def test_compiled_forward_does_not_copy_saved_weights(self):
+    """Verifies that a compiled forward holds no copies of the weights."""
+    # Two 16 MiB weights: 4096 * 1024 * 4 bytes each.
+    model = torch.nn.Sequential(
+        torch.nn.Linear(1024, 4096, bias=False),
+        torch.nn.SiLU(),
+        torch.nn.Linear(4096, 1024, bias=False),
+    ).to("tpu")
+    x = torch.randn(8, 1024, device="tpu", requires_grad=True)
+    compiled = torch.compile(
+        model, backend="tpu", options={"serializable": False}
+    )
+    # Compiles the forward and backward and allocates the gradients.
+    compiled(x).sum().backward()
 
-    base_compiler = compiler.StaticCompiler()
-    split_comp = split_compiler.SplitCompiler(base_compiler)
+    gc.collect()
+    torch.accelerator.synchronize()
+    mem_before = torch.accelerator.memory_allocated()
+    y = compiled(x)
+    torch.accelerator.synchronize()
+    mem_held = torch.accelerator.memory_allocated() - mem_before
+    y.sum().backward()
 
-    x = torch.ones((2, 4), device="tpu")
-    weight = torch.ones((3, 4), device="tpu")
-    executable = split_comp(gm, (x, weight))
-    res_mm, res_weight = executable(x, weight)
+    # Backward needs both weights. The activations it needs and `y` take
+    # less than 1 MiB, and copies of the weights would add 32 MiB.
+    self.assertLess(mem_held, 5 * 1024 * 1024)  # < 5 MiB
 
-    self.assertIs(res_weight, weight)
-    utils.assert_close(res_mm.cpu(), torch.full((2, 3), 4.0, device="cpu"))
+  def test_compiled_forward_copies_buffer_it_updates(self):
+    """Verifies backward after a forward that reads and then updates a buffer.
+
+    AOTAutograd copies the new value into the buffer after the forward runs.
+    Backward needs the old value, so the forward must return a copy.
+    """
+
+    class NormalizeByRunningVariance(torch.nn.Module):
+
+      def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(16, 32, bias=False)
+        self.register_buffer("running_var", torch.ones(32))
+
+      def forward(self, x):
+        h = self.linear(x)
+        y = h * torch.rsqrt(self.running_var + 1e-5)
+        with torch.no_grad():
+          self.running_var.lerp_(h.var(0), 0.1)
+        return y
+
+    model = NormalizeByRunningVariance().to("tpu")
+    eager_model = copy.deepcopy(model)
+    x = torch.randn(8, 16, device="tpu", requires_grad=True)
+    eager_x = x.detach().clone().requires_grad_()
+    compiled = torch.compile(
+        model, backend="tpu", options={"serializable": False}
+    )
+
+    compiled(x).sum().backward()
+    eager_model(eager_x).sum().backward()
+
+    utils.assert_close(x.grad.cpu(), eager_x.grad.cpu())
+    utils.assert_close(model.running_var.cpu(), eager_model.running_var.cpu())
 
   def test_compiling_get_attr_constant_does_not_copy_it(self):
     """Verifies that compiling a graph does not duplicate `get_attr` constants."""
