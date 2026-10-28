@@ -120,6 +120,9 @@ def _track_op_overload(
   if any(r.alias_info is not None for r in schema.returns):
     aliases[node] = set().union(*(a for _, a in annotated))
 
+  # `set_` writes to `self`, so unlike `_UNANNOTATED_ALIAS_OPS` it needs the
+  # schema handling above. The schema leaves out that `self` and the result
+  # share the storage of `source` after the call.
   if node.target in _SET_SOURCE_OPS:
     values = {argument.name: value for argument, value in arguments}
     source = _aliased(aliases, values["source"])

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import collections
-import copy
 import gc
 import pickle
 import unittest.mock
@@ -171,37 +170,38 @@ class SplitCompileTest(seed_test_utils.RepeatableTest):
   def test_compiled_forward_copies_buffer_it_updates(self):
     """Verifies backward after a forward that reads and then updates a buffer.
 
-    AOTAutograd copies the new value into the buffer after the forward runs.
-    Backward needs the old value, so the forward must return a copy.
+    The forward returns the buffer for backward, and AOTAutograd copies the
+    new value into it after the forward runs. Unlike the weights in the test
+    above, the buffer has to be returned as a copy.
     """
 
-    class NormalizeByRunningVariance(torch.nn.Module):
+    class ScaleThenUpdate(torch.nn.Module):
 
       def __init__(self):
         super().__init__()
-        self.linear = torch.nn.Linear(16, 32, bias=False)
-        self.register_buffer("running_var", torch.ones(32))
+        self.register_buffer("scale", torch.ones(4))
 
       def forward(self, x):
-        h = self.linear(x)
-        y = h * torch.rsqrt(self.running_var + 1e-5)
-        with torch.no_grad():
-          self.running_var.lerp_(h.var(0), 0.1)
+        # Backward needs `scale + 1`. Eager autograd saves the sum, so the
+        # update below is allowed, but the min-cut partitioner saves `scale`
+        # itself and recomputes the sum in backward.
+        y = x * (self.scale + 1)
+        self.scale.add_(1)
         return y
 
-    model = NormalizeByRunningVariance().to("tpu")
-    eager_model = copy.deepcopy(model)
-    x = torch.randn(8, 16, device="tpu", requires_grad=True)
-    eager_x = x.detach().clone().requires_grad_()
+    model = ScaleThenUpdate()
+    tpu_model = ScaleThenUpdate().to("tpu")
+    x = torch.randn(2, 4, requires_grad=True)
+    tpu_x = x.detach().to("tpu").requires_grad_()
     compiled = torch.compile(
-        model, backend="tpu", options={"serializable": False}
+        tpu_model, backend="tpu", options={"serializable": False}
     )
 
-    compiled(x).sum().backward()
-    eager_model(eager_x).sum().backward()
+    model(x).sum().backward()
+    compiled(tpu_x).sum().backward()
 
-    utils.assert_close(x.grad.cpu(), eager_x.grad.cpu())
-    utils.assert_close(model.running_var.cpu(), eager_model.running_var.cpu())
+    utils.assert_close(tpu_x.grad.cpu(), x.grad)
+    utils.assert_close(tpu_model.scale.cpu(), model.scale)
 
   def test_compiling_get_attr_constant_does_not_copy_it(self):
     """Verifies that compiling a graph does not duplicate `get_attr` constants."""

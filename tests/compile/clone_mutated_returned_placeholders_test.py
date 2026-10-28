@@ -33,6 +33,17 @@ _UNANNOTATED_ALIAS_OPS = (
     clone_mutated_returned_placeholders._UNANNOTATED_ALIAS_OPS
 )
 _SET_SOURCE_OPS = clone_mutated_returned_placeholders._SET_SOURCE_OPS
+
+# The required non-tensor arguments of each op, with values valid for
+# 4-element tensors. Ops whose required arguments are all tensors are not
+# listed.
+_NON_TENSOR_ARGS: dict[torch._ops.OpOverload, dict[str, Any]] = {
+    aten._unsafe_view.default: {"size": [2, 2]},
+    aten.set_.source_Tensor_storage_offset: {"storage_offset": 0, "size": [4]},
+    aten.unsafe_chunk.default: {"chunks": 2},
+    aten.unsafe_split.Tensor: {"split_size": 2},
+    aten.unsafe_split_with_sizes.default: {"split_sizes": [2, 2]},
+}
 # pylint: enable=protected-access
 
 
@@ -47,18 +58,22 @@ def _cloned_placeholders(graph: Graph) -> set[fx.Node]:
   }
 
 
-def _named(ops: frozenset[torch._ops.OpOverload]) -> list[tuple[str, Any]]:
-  """Names a test case after each op, in a fixed order."""
+def _get_readable_op_names(
+    ops: frozenset[torch._ops.OpOverload],
+) -> list[tuple[str, torch._ops.OpOverload]]:
+  """Returns `(name, op)` for each op, sorted by name.
+
+  The name is the op's qualified name with dots replaced by underscores.
+  """
   return [(str(op).replace(".", "_"), op) for op in sorted(ops, key=str)]
 
 
-def _call(
+def _call_on_tensors(
     graph: Graph, op: torch._ops.OpOverload, *tensors: fx.Node
 ) -> fx.Node:
-  """Calls `op` with `tensors` as its tensor arguments, in order.
+  """Adds a call of `op` with `tensors` as its tensor arguments, in order.
 
-  The pass only reads schemas and the graphs are never run, so the other
-  required arguments get dummy values.
+  The other required arguments come from `_NON_TENSOR_ARGS`.
 
   Args:
     graph: The graph to add the call to.
@@ -69,16 +84,15 @@ def _call(
     The node of the call.
   """
   remaining = iter(tensors)
+  non_tensor_args = _NON_TENSOR_ARGS.get(op, {})
   args: list[Any] = []
   for argument in op._schema.arguments:  # pylint: disable=protected-access
     if argument.kwarg_only or argument.has_default_value():
       break
     if isinstance(argument.type, torch.TensorType):
       args.append(next(remaining))
-    elif isinstance(argument.type, torch.ListType):
-      args.append([1])
     else:
-      args.append(1)
+      args.append(non_tensor_args[argument.name])
   return graph.call_function(op, tuple(args))
 
 
@@ -93,31 +107,72 @@ def _tensor_placeholders(
   ]
 
 
-def _write(graph: Graph, node: fx.Node) -> None:
+def _add_one_in_place(graph: Graph, node: fx.Node) -> None:
+  """Adds `node.add_(1.0)`."""
   graph.call_function(aten.add_.Scalar, (node, 1.0))
 
 
-def _write_result(
+def _add_one_in_place_to_result(
     graph: Graph, op: torch._ops.OpOverload, result: fx.Node
 ) -> None:
-  """Writes to the result of `op`, or to its first result if it is a list."""
+  """Adds 1 in place to `result`, or to its first element if it is a list."""
   returns = op._schema.returns  # pylint: disable=protected-access
   if isinstance(returns[0].type, torch.ListType):
     result = graph.call_function(operator.getitem, (result, 0))
-  _write(graph, result)
+  _add_one_in_place(graph, result)
 
 
 def _empty(graph: Graph) -> fx.Node:
-  return graph.call_function(aten.empty.memory_format, ([0],))
+  return graph.call_function(aten.empty.memory_format, ([4],))
 
 
 def _view(graph: Graph, node: fx.Node) -> fx.Node:
-  return graph.call_function(aten.view.default, (node, [16]))
+  return graph.call_function(aten.view.default, (node, [2, 2]))
 
 
-def _split_piece(graph: Graph, node: fx.Node) -> fx.Node:
+def _split_and_get_first_piece(graph: Graph, node: fx.Node) -> fx.Node:
+  """Adds `node.split(2)[0]`."""
   pieces = graph.call_function(aten.split.Tensor, (node, 2))
   return graph.call_function(operator.getitem, (pieces, 0))
+
+
+def _mm_with_transpose(graph: Graph, p: fx.Node) -> None:
+  """Adds `p @ p.t()`."""
+  transpose = graph.call_function(aten.t.default, (p,))
+  graph.call_function(aten.mm.default, (p, transpose))
+
+
+def _add_one_in_place_to_view_of_new_tensor(graph: Graph, p: fx.Node) -> None:
+  """Adds `(p * 2.0).view(2, 2).add_(1.0)`."""
+  new_tensor = graph.call_function(aten.mul.Scalar, (p, 2.0))
+  _add_one_in_place(graph, _view(graph, new_tensor))
+
+
+def _add_into_new_tensor(graph: Graph, p: fx.Node) -> None:
+  """Adds `torch.add(p, p, out=torch.empty(4))`."""
+  graph.call_function(aten.add.out, (p, p), {"out": _empty(graph)})
+
+
+def _add_one_in_place_to_view(graph: Graph, p: fx.Node) -> None:
+  """Adds `p.view(2, 2).add_(1.0)`."""
+  _add_one_in_place(graph, _view(graph, p))
+
+
+def _zero_first_split_piece(graph: Graph, p: fx.Node) -> None:
+  """Adds `p.split(2)[0].zero_()`."""
+  piece = _split_and_get_first_piece(graph, p)
+  graph.call_function(aten.zero_.default, (piece,))
+
+
+def _add_new_tensors_into(graph: Graph, p: fx.Node) -> None:
+  """Adds `torch.add(a, b, out=p)` for new tensors `a` and `b`."""
+  new_tensors = (_empty(graph), _empty(graph))
+  graph.call_function(aten.add.out, new_tensors, {"out": p})
+
+
+def _call_python_function(graph: Graph, p: fx.Node) -> None:
+  """Adds a call of a Python function, which has no schema, on `p`."""
+  graph.call_function(lambda t: t, (p,))
 
 
 class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
@@ -313,25 +368,10 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
     self.assertEmpty(clone_nodes)
 
   @parameterized.named_parameters(
-      (
-          "mm",
-          lambda g, p: g.call_function(
-              aten.mm.default, (p, g.call_function(aten.t.default, (p,)))
-          ),
-      ),
-      ("split", _split_piece),
-      (
-          "write_to_new_tensor",
-          lambda g, p: _write(
-              g, _view(g, g.call_function(aten.mul.Scalar, (p, 2.0)))
-          ),
-      ),
-      (
-          "out_source",
-          lambda g, p: g.call_function(
-              aten.add.out, (p, p), {"out": _empty(g)}
-          ),
-      ),
+      ("mm", _mm_with_transpose),
+      ("split", _split_and_get_first_piece),
+      ("write_to_new_tensor", _add_one_in_place_to_view_of_new_tensor),
+      ("out_source", _add_into_new_tensor),
   )
   def test_read_only_returned_placeholder_not_cloned(self, read):
     """Verifies that a returned placeholder that is only read is not cloned."""
@@ -345,21 +385,11 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
     self.assertEmpty(_cloned_placeholders(graph))
 
   @parameterized.named_parameters(
-      ("in_place", _write),
-      ("through_view", lambda g, p: _write(g, _view(g, p))),
-      (
-          "through_split",
-          lambda g, p: g.call_function(
-              aten.zero_.default, (_split_piece(g, p),)
-          ),
-      ),
-      (
-          "out_kwarg",
-          lambda g, p: g.call_function(
-              aten.add.out, (_empty(g), _empty(g)), {"out": p}
-          ),
-      ),
-      ("schemaless_target", lambda g, p: g.call_function(lambda t: t, (p,))),
+      ("in_place", _add_one_in_place),
+      ("through_view", _add_one_in_place_to_view),
+      ("through_split", _zero_first_split_piece),
+      ("out_kwarg", _add_new_tensors_into),
+      ("schemaless_target", _call_python_function),
   )
   def test_written_returned_placeholder_is_cloned(self, write):
     """Verifies writes in place, through aliases, and by unknown targets."""
@@ -372,67 +402,71 @@ class CloneMutatedReturnedPlaceholdersTest(seed_test_utils.RepeatableTest):
 
     self.assertEqual(_cloned_placeholders(graph), {p})
 
-  @parameterized.named_parameters(*_named(_UNANNOTATED_ALIAS_OPS))
+  @parameterized.named_parameters(
+      *_get_readable_op_names(_UNANNOTATED_ALIAS_OPS)
+  )
   def test_write_through_unannotated_alias_is_cloned(self, op):
     """Verifies that a write to the result of `op` writes to its inputs."""
     graph = Graph()
     inputs = _tensor_placeholders(graph, op)
-    _write_result(graph, op, _call(graph, op, *inputs))
+    result = _call_on_tensors(graph, op, *inputs)
+    _add_one_in_place_to_result(graph, op, result)
     graph.output(tuple(inputs))
 
     clone_mutated_returned_placeholders.apply(graph)
 
     self.assertEqual(_cloned_placeholders(graph), set(inputs))
 
-  @parameterized.named_parameters(*_named(_UNANNOTATED_ALIAS_OPS))
+  @parameterized.named_parameters(
+      *_get_readable_op_names(_UNANNOTATED_ALIAS_OPS)
+  )
   def test_unannotated_alias_op_does_not_write(self, op):
     """Verifies that `op` alone does not count as a write to its inputs."""
     graph = Graph()
     inputs = _tensor_placeholders(graph, op)
-    graph.output((*inputs, _call(graph, op, *inputs)))
+    graph.output((*inputs, _call_on_tensors(graph, op, *inputs)))
 
     clone_mutated_returned_placeholders.apply(graph)
 
     self.assertEmpty(_cloned_placeholders(graph))
 
-  @parameterized.named_parameters(
-      (f"{name}_{'self' if write_self else 'result'}", op, write_self)
-      for name, op in _named(_SET_SOURCE_OPS)
-      for write_self in (True, False)
+  @parameterized.product(
+      op=sorted(_SET_SOURCE_OPS, key=str),
+      write_self=[True, False],
   )
   def test_write_after_set_source_is_cloned(self, op, write_self):
     """Verifies that `self` and the result of `self.set_(source)` alias it."""
     graph = Graph()
     source = graph.placeholder("source")
     self_ = _empty(graph)
-    result = _call(graph, op, self_, source)
-    _write(graph, self_ if write_self else result)
+    result = _call_on_tensors(graph, op, self_, source)
+    _add_one_in_place(graph, self_ if write_self else result)
     graph.output((source,))
 
     clone_mutated_returned_placeholders.apply(graph)
 
     self.assertEqual(_cloned_placeholders(graph), {source})
 
-  @parameterized.named_parameters(*_named(_SET_SOURCE_OPS))
+  @parameterized.named_parameters(*_get_readable_op_names(_SET_SOURCE_OPS))
   def test_set_source_is_not_written(self, op):
     """Verifies that `self.set_(source)` alone does not write to `source`."""
     graph = Graph()
     source = graph.placeholder("source")
-    _call(graph, op, _empty(graph), source)
+    _call_on_tensors(graph, op, _empty(graph), source)
     graph.output((source,))
 
     clone_mutated_returned_placeholders.apply(graph)
 
     self.assertEmpty(_cloned_placeholders(graph))
 
-  @parameterized.named_parameters(*_named(_SET_SOURCE_OPS))
+  @parameterized.named_parameters(*_get_readable_op_names(_SET_SOURCE_OPS))
   def test_write_to_set_placeholder_writes_new_source(self, op):
     """Verifies that a placeholder rebound by `set_` aliases its new source."""
     graph = Graph()
     p = graph.placeholder("p")
     source = graph.placeholder("source")
-    _call(graph, op, p, source)
-    _write(graph, p)
+    _call_on_tensors(graph, op, p, source)
+    _add_one_in_place(graph, p)
     graph.output((p, source))
 
     clone_mutated_returned_placeholders.apply(graph)
