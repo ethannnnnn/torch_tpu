@@ -17,7 +17,6 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
-#include <vector>
 
 #include "ATen/core/Reduction.h"
 #include "absl/status/statusor.h"
@@ -49,18 +48,39 @@ absl::StatusOr<mlir::MlirOp> SelectTargetByMaskedSum(mlir::MlirOp self,
   TT_ASSIGN_OR_RETURN(mlir::MlirOp class_iota, Iota(self, 1, i32_type));
   TT_ASSIGN_OR_RETURN(mlir::MlirOp target_i32,
                       CastIfNeeded(safe_target, mlir::ElementType::I32));
-  std::vector<int64_t> target_dims = {0};
+  Dimensions target_dims = {0};
   for (int64_t i = 2; i < rank; ++i) {
     target_dims.push_back(i);
   }
-  TT_ASSIGN_OR_RETURN(
-      mlir::MlirOp target_bcast,
-      BroadcastIfNeeded(target_i32, GetDimensions(class_iota), target_dims));
+  TT_ASSIGN_OR_RETURN(mlir::MlirOp target_bcast,
+                      BroadcastIfNeeded(target_i32, class_iota, target_dims));
   mlir::MlirOp is_target = mlir::stablehlo::Compare(
       class_iota, target_bcast, mlir::stablehlo::ComparisonDirection::EQ);
   mlir::MlirOp zero = MakeConstantLike(self, 0.0);
   mlir::MlirOp masked = mlir::stablehlo::Select(is_target, self, zero);
   return BuildSumShlo(masked, {1}, ReductionMode::kDropDims);
+}
+
+// Returns `self[n, safe_target[n, ...], ...]` along class dimension 1.
+absl::StatusOr<mlir::MlirOp> SelectTargetLogProbs(
+    mlir::MlirOp self, mlir::MlirOp safe_target,
+    NllTargetSelection target_selection) {
+  switch (target_selection) {
+    case NllTargetSelection::kGather: {
+      // `self` is already in the compute dtype.
+      TT_ASSIGN_OR_RETURN(const mlir::ElementType compute_dtype,
+                          GetElementType(self));
+      TT_ASSIGN_OR_RETURN(mlir::MlirOp target_unsqueeze,
+                          Unsqueeze(safe_target, 1));
+      TT_ASSIGN_OR_RETURN(
+          mlir::MlirOp gathered_unsqueeze,
+          BuildGatherShlo(self, 1, target_unsqueeze, /*sparse_grad=*/false,
+                          compute_dtype));
+      return Squeeze(gathered_unsqueeze, {1});
+    }
+    case NllTargetSelection::kMaskedSum:
+      return SelectTargetByMaskedSum(self, safe_target);
+  }
 }
 
 }  // namespace
@@ -149,17 +169,9 @@ absl::StatusOr<MlirOpResults<2>> BuildNllLossForwardOutShlo(
   mlir::MlirOp safe_target = mlir::stablehlo::Select(mask, target, zero_target);
 
   // raw_loss = -self[safe_target] along class dimension 1.
-  mlir::MlirOp gathered;
-  if (target_selection == NllTargetSelection::kMaskedSum) {
-    TT_ASSIGN_OR_RETURN(gathered, SelectTargetByMaskedSum(self, safe_target));
-  } else {
-    TT_ASSIGN_OR_RETURN(mlir::MlirOp target_unsqueeze,
-                        Unsqueeze(safe_target, 1));
-    TT_ASSIGN_OR_RETURN(mlir::MlirOp gathered_unsqueeze,
-                        BuildGatherShlo(self, 1, target_unsqueeze,
-                                        /*sparse_grad=*/false, compute_dtype));
-    TT_ASSIGN_OR_RETURN(gathered, Squeeze(gathered_unsqueeze, {1}));
-  }
+  TT_ASSIGN_OR_RETURN(
+      mlir::MlirOp gathered,
+      SelectTargetLogProbs(self, safe_target, target_selection));
   mlir::MlirOp raw_loss = mlir::stablehlo::Neg(gathered);
 
   // Apply class weights and mask out ignored positions using Select (not Mul).
