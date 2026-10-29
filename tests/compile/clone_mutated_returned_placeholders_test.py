@@ -34,11 +34,15 @@ _UNANNOTATED_ALIAS_OPS = (
 )
 _SET_SOURCE_OPS = clone_mutated_returned_placeholders._SET_SOURCE_OPS
 
-# The required non-tensor arguments of each op, with values valid for
-# 4-element tensors. Ops whose required arguments are all tensors are not
-# listed.
+# The required non-tensor arguments of each op in `_UNANNOTATED_ALIAS_OPS`
+# and `_SET_SOURCE_OPS`, with values valid for 4-element tensors. Every op
+# has an entry, empty if its required arguments are all tensors, so a new op
+# without one fails its tests with a KeyError.
 _NON_TENSOR_ARGS: dict[torch._ops.OpOverload, dict[str, Any]] = {
     aten._unsafe_view.default: {"size": [2, 2]},
+    aten.lift.default: {},
+    aten.set.source_Tensor: {},
+    aten.set_.source_Tensor: {},
     aten.set_.source_Tensor_storage_offset: {"storage_offset": 0, "size": [4]},
     aten.unsafe_chunk.default: {"chunks": 2},
     aten.unsafe_split.Tensor: {"split_size": 2},
@@ -84,7 +88,7 @@ def _call_on_tensors(
     The node of the call.
   """
   remaining = iter(tensors)
-  non_tensor_args = _NON_TENSOR_ARGS.get(op, {})
+  non_tensor_args = _NON_TENSOR_ARGS[op]
   args: list[Any] = []
   for argument in op._schema.arguments:  # pylint: disable=protected-access
     if argument.kwarg_only or argument.has_default_value():
