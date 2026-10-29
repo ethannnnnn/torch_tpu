@@ -16188,6 +16188,21 @@ class MaskedSoftmaxErrorTest(et.ErrorTestBase):
     ):
       torch.split_with_sizes_copy(self_t, [2, 2], dim=0, out=out)
 
+  def test_split_with_sizes_copy_dim1_split_sizes_mismatch(self):
+    out = [
+        torch.empty(2, 2, device=et.device()),
+        torch.empty(2, 3, device=et.device()),
+    ]
+    with et.assert_raises_message(
+        RuntimeError,
+        tpu="""split_with_sizes_copy(): expected split_sizes to sum to 6 (the input's size at dimension 1), got [2, 3]""",
+        gpu="""split_with_sizes expects split_sizes to sum exactly to 6 (input tensor's size at dimension 1), but got split_sizes=[2, 3]""",
+        message_reviewed_by="pgmoka",
+    ):
+      torch.split_with_sizes_copy(
+          torch.zeros(2, 6, device=et.device()), [2, 3], dim=1, out=out
+      )
+
   def test_select_scatter_errors(self):
     self_0d = torch.tensor(1.0, device=et.device())
     src_0d = torch.tensor(2.0, device=et.device())
